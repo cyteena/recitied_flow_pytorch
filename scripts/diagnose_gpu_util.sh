@@ -31,6 +31,10 @@ CKPT_SPARSE=${CKPT_SPARSE:-200}
 TRAIN_SCRIPT=${TRAIN_SCRIPT:-train_oxford.py}
 # Whether to include sampling/checkpoint periodic test (0=skip, 1=run)
 INCLUDE_SAMPLING=${INCLUDE_SAMPLING:-0}
+# New: Multi-experiment mode (0=original diagnosis, 1=run multiple single-GPU experiments in parallel)
+MULTI_EXP_MODE=${MULTI_EXP_MODE:-0}
+# List of experiment configs (e.g., "lr:3e-4,lr:1e-4,batch:64")
+EXP_CONFIGS=${EXP_CONFIGS:-"default"}
 
 ########################
 # Resolve repo root     #
@@ -67,6 +71,24 @@ mkdir -p "$OUT_DIR"
 ########################
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
+# Parse config string like "lr:3e-4,batch:64" into CLI args
+parse_config() {
+  local config="$1"
+  local args=()
+  IFS=',' read -r -a parts <<< "$config"
+  for part in "${parts[@]}"; do
+    IFS=':' read -r key val <<< "$part"
+    case "$key" in
+      lr) args+=(--learning_rate "$val") ;;
+      batch) args+=(--batch_size "$val") ;;
+      steps) args+=(--num_train_steps "$val") ;;
+      workers) args+=(--num_workers "$val") ;;
+      *) log "WARN: Unknown config key '$key', ignoring" ;;
+    esac
+  done
+  printf '%s\n' "${args[@]}"
+}
+
 # Extract the last "Time Distribution" block from a log file and print lines as "name: pct%"
 extract_last_time_dist() {
   local logfile="$1"
@@ -88,6 +110,7 @@ run_exp() {
   local np="$1"; shift
   local extra_args=("$@")
   local log_file="$OUT_DIR/${label}.log"
+  local temp_log="$OUT_DIR/${label}_temp.log"
 
   log "Running: $label (np=$np) -> $log_file"
   RECTIFIED_FLOW_PROFILE=1 \
@@ -96,11 +119,68 @@ run_exp() {
     --batch_size "$BATCH" --image_size "$IMSIZE" \
     --num_train_steps "$STEPS" --num_workers "$WORKERS" \
     "${extra_args[@]}" \
-    2>&1 | tee "$log_file"
+    > "$temp_log" 2>&1
+
+  # Extract only profiling reports from temp log
+  awk '
+    /^=== Profiling Report/ { in_report=1; print; next }
+    /^=== Final Profiling Summary/ { in_report=1; print; next }
+    in_report && /^===/ && /Summary/ { print; next }
+    in_report && /^[A-Za-z_]+: [0-9.]+s/ { print; next }
+    in_report && /^Time Distribution:/ { print; next }
+    in_report && /^[A-Za-z_]+: [0-9.]+%$/ { print; next }
+    in_report && /^$/ { print; next }
+    /^===/ && /Summary/ { in_report=0; print; next }
+    /^$/ { if(in_report) print }
+  ' "$temp_log" > "$log_file"
+
+  rm -f "$temp_log"
 
   if ! grep -q "^Time Distribution:" "$log_file"; then
     log "WARN: No profiling Time Distribution found in $label log."
   fi
+}
+
+# Run a single-GPU experiment with specific config and GPU
+run_single_gpu_exp() {
+  local exp_id="$1"
+  local gpu_id="$2"
+  local config="$3"
+  local label="exp_${exp_id}_gpu${gpu_id}_${config//:/_}"
+  local log_file="$OUT_DIR/${label}.log"
+  local temp_log="$OUT_DIR/${label}_temp.log"
+
+  local extra_args
+  extra_args="$(parse_config "$config")"
+
+  log "Starting exp $exp_id on GPU $gpu_id with config '$config' -> $log_file"
+  CUDA_VISIBLE_DEVICES="$gpu_id" \
+  RECTIFIED_FLOW_PROFILE=1 \
+  accelerate launch --num_processes 1 \
+    "$TRAIN_SCRIPT" \
+    --batch_size "$BATCH" --image_size "$IMSIZE" \
+    --num_train_steps "$STEPS" --num_workers "$WORKERS" \
+    $extra_args \
+    --save_results_every "$SAVE_MANY" --checkpoint_every "$SAVE_MANY" \
+    > "$temp_log" 2>&1 &
+
+  # Extract profiling in background
+  (
+    wait $!
+    awk '
+      /^=== Profiling Report/ { in_report=1; print; next }
+      /^=== Final Profiling Summary/ { in_report=1; print; next }
+      in_report && /^===/ && /Summary/ { print; next }
+      in_report && /^[A-Za-z_]+: [0-9.]+s/ { print; next }
+      in_report && /^Time Distribution:/ { print; next }
+      in_report && /^[A-Za-z_]+: [0-9.]+%$/ { print; next }
+      in_report && /^$/ { print; next }
+      /^===/ && /Summary/ { in_report=0; print; next }
+      /^$/ { if(in_report) print }
+    ' "$temp_log" > "$log_file"
+    rm -f "$temp_log"
+    log "Finished exp $exp_id on GPU $gpu_id"
+  ) &
 }
 
 summarize_exp() {
@@ -123,44 +203,79 @@ summarize_exp() {
 log "Detected GPUs: $GPUS"
 log "Logs: $OUT_DIR"
 
-# A1) Single-GPU baseline (no sampling/ckpt)
-run_exp "A1_single_gpu_baseline" 1 --save_results_every "$SAVE_MANY" --checkpoint_every "$SAVE_MANY"
+if (( MULTI_EXP_MODE == 1 )); then
+  # Multi-experiment mode: run multiple single-GPU experiments in parallel
+  IFS=',' read -r -a configs <<< "$EXP_CONFIGS"
+  local exp_count="${#configs[@]}"
+  local gpu_idx=0
+  local pids=()
 
-# A2) Multi-GPU baseline (no sampling/ckpt)
-if (( GPUS > 1 )); then
-  run_exp "A2_multi_gpu_baseline" "$GPUS" --save_results_every "$SAVE_MANY" --checkpoint_every "$SAVE_MANY"
+  log "Starting $exp_count experiments across $GPUS GPUs"
+
+  for ((exp_id=0; exp_id<exp_count; exp_id++)); do
+    local config="${configs[$exp_id]}"
+    local gpu_id="$gpu_idx"
+    run_single_gpu_exp "$exp_id" "$gpu_id" "$config"
+    pids+=($!)
+    gpu_idx=$(( (gpu_idx + 1) % GPUS ))
+  done
+
+  # Wait for all experiments to finish
+  for pid in "${pids[@]}"; do
+    wait "$pid"
+  done
+
+  log "All experiments completed"
+
+  # Summarize all experiments
+  log "\n==== Multi-Experiment Summary ===="
+  for ((exp_id=0; exp_id<exp_count; exp_id++)); do
+    local config="${configs[$exp_id]}"
+    local gpu_id=$(( exp_id % GPUS ))
+    local label="exp_${exp_id}_gpu${gpu_id}_${config//:/_}"
+    summarize_exp "$label"
+  done
+
 else
-  log "Skipping A2 (only one GPU detected)."
-fi
+  # Original diagnosis mode
+  # A1) Single-GPU baseline (no sampling/ckpt)
+  run_exp "A1_single_gpu_baseline" 1 --save_results_every "$SAVE_MANY" --checkpoint_every "$SAVE_MANY"
 
-# B) Sampling/Checkpoint periodic work (observe periodic dips) — disabled by default
-if (( GPUS > 1 )) && (( INCLUDE_SAMPLING == 1 )); then
-  run_exp "B_sampling_checkpoint" "$GPUS" --save_results_every "$SAVE_SPARSE" --checkpoint_every "$CKPT_SPARSE"
-fi
-
-# C) Data loader sweep (no sampling/ckpt)
-if (( GPUS > 1 )); then
-  for W in 4 8 12 16; do
-    WORKERS="$W" run_exp "C_workers_${W}" "$GPUS" --save_results_every "$SAVE_MANY" --checkpoint_every "$SAVE_MANY"
-  done
-fi
-
-########################
-# Summary              #
-########################
-log "\n==== Diagnosis Summary (top time share in last profile block) ===="
-summarize_exp "A1_single_gpu_baseline"
-if (( GPUS > 1 )); then
-  summarize_exp "A2_multi_gpu_baseline"
-  if (( INCLUDE_SAMPLING == 1 )); then
-    summarize_exp "B_sampling_checkpoint"
+  # A2) Multi-GPU baseline (no sampling/ckpt)
+  if (( GPUS > 1 )); then
+    run_exp "A2_multi_gpu_baseline" "$GPUS" --save_results_every "$SAVE_MANY" --checkpoint_every "$SAVE_MANY"
+  else
+    log "Skipping A2 (only one GPU detected)."
   fi
-  for W in 4 8 12 16; do
-    summarize_exp "C_workers_${W}"
-  done
-fi
 
-cat << 'EOF'
+  # B) Sampling/Checkpoint periodic work (observe periodic dips) — disabled by default
+  if (( GPUS > 1 )) && (( INCLUDE_SAMPLING == 1 )); then
+    run_exp "B_sampling_checkpoint" "$GPUS" --save_results_every "$SAVE_SPARSE" --checkpoint_every "$CKPT_SPARSE"
+  fi
+
+  # C) Data loader sweep (no sampling/ckpt)
+  if (( GPUS > 1 )); then
+    for W in 4 8 12 16; do
+      WORKERS="$W" run_exp "C_workers_${W}" "$GPUS" --save_results_every "$SAVE_MANY" --checkpoint_every "$SAVE_MANY"
+    done
+  fi
+
+  ########################
+  # Summary              #
+  ########################
+  log "\n==== Diagnosis Summary (top time share in last profile block) ===="
+  summarize_exp "A1_single_gpu_baseline"
+  if (( GPUS > 1 )); then
+    summarize_exp "A2_multi_gpu_baseline"
+    if (( INCLUDE_SAMPLING == 1 )); then
+      summarize_exp "B_sampling_checkpoint"
+    fi
+    for W in 4 8 12 16; do
+      summarize_exp "C_workers_${W}"
+    done
+  fi
+
+  cat << 'EOF'
 
 Interpretation:
 - If A1 is smooth and A2 shows a different top (e.g., synchronization/optimizer/metrics), multi-GPU sync or main-rank side work is likely the main cause.
@@ -175,3 +290,4 @@ Tips:
 
 All logs kept under diagnostics_logs/<timestamp>.
 EOF
+fi

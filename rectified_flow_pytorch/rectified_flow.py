@@ -1115,6 +1115,12 @@ class Trainer(Module):
         sample_during_training: bool = True,
         log_every: int = 10,
         compute_norms_every: int = 0,
+        # Learning rate scheduling
+        use_warmup: bool = False,
+        warmup_steps: int = 1000,
+        use_lr_decay: bool = False,
+        lr_decay_steps: int = 5000,
+        lr_decay_factor: float = 0.1,
     ):
         super().__init__()
         self.accelerator = Accelerator(**accelerate_kwargs)
@@ -1247,6 +1253,28 @@ class Trainer(Module):
         self.sample_during_training = sample_during_training
         self.log_every = max(1, int(log_every))
         self.compute_norms_every = int(compute_norms_every)
+
+        # Learning rate scheduling
+        self.use_warmup = use_warmup
+        self.warmup_steps = warmup_steps
+        self.use_lr_decay = use_lr_decay
+        self.lr_decay_steps = lr_decay_steps
+        self.lr_decay_factor = lr_decay_factor
+
+        # Initialize learning rate scheduler
+        self.scheduler = None
+        if self.use_warmup or self.use_lr_decay:
+            from torch.optim.lr_scheduler import LambdaLR
+
+            def lr_lambda(step):
+                lr = 1.0
+                if self.use_warmup and step < self.warmup_steps:
+                    lr *= step / max(1, self.warmup_steps)
+                if self.use_lr_decay and step >= self.lr_decay_steps:
+                    lr *= self.lr_decay_factor
+                return lr
+
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda)
 
         self.init_wandb()
 
@@ -1549,6 +1577,10 @@ class Trainer(Module):
             else:
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
+
+            # Apply learning rate scheduler
+            if self.scheduler is not None:
+                self.scheduler.step()
 
             # Profile EMA updates
             if self.enable_profiling:
