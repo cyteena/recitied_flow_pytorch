@@ -1316,9 +1316,12 @@ class Trainer(Module):
 
         save_package = dict(
             model=self.accelerator.unwrap_model(self.model).state_dict(),
-            ema_model=self.ema_model.state_dict(),
             optimizer=self.optimizer.state_dict(),
         )
+
+        # Only save EMA model if it exists
+        if self.ema_model is not None:
+            save_package["ema_model"] = self.ema_model.state_dict()
 
         torch.save(save_package, str(self.checkpoints_folder / path))
 
@@ -1329,8 +1332,11 @@ class Trainer(Module):
         load_package = torch.load(path)
 
         self.model.load_state_dict(load_package["model"])
-        self.ema_model.load_state_dict(load_package["ema_model"])
         self.optimizer.load_state_dict(load_package["optimizer"])
+        
+        # Only load EMA model if it exists in the checkpoint and we have EMA enabled
+        if "ema_model" in load_package and self.ema_model is not None:
+            self.ema_model.load_state_dict(load_package["ema_model"])
 
     def log(self, *args, **kwargs):
         return self.accelerator.log(*args, **kwargs)

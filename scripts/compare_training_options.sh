@@ -16,9 +16,9 @@ set -euo pipefail
 # Configurable defaults #
 ########################
 STEPS=${STEPS:-10000}
-BATCH=${BATCH:-16}
-IMSIZE=${IMSIZE:-64}
-WORKERS=${WORKERS:-4}
+BATCH=${BATCH:-64}  # Increased from 16 to 64 for better GPU utilization
+IMSIZE=${IMSIZE:-128}  # Increased from 64 to 128 for more computation
+WORKERS=${WORKERS:-8}  # Increased from 4 to 8 for better data loading
 TRAIN_SCRIPT=${TRAIN_SCRIPT:-compare_training_options.py}
 
 ########################
@@ -38,16 +38,9 @@ else
 fi
 
 ########################
-# Output directories    #
-########################
-TS="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="comparison_logs/$TS"
-mkdir -p "$OUT_DIR"
-
-########################
 # Helpers               #
 ########################
-log() { echo "[$(date +%H:%M:%S)] $*"; }
+log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
 run_experiment() {
   local exp_id="$1"
@@ -57,33 +50,50 @@ run_experiment() {
   local sched="$5"
 
   local exp_name="exp_${exp_id}_mv${mean_var}_cons${consistency}_sched${sched}"
-  local log_file="$OUT_DIR/${exp_name}.log"
 
   log "Starting exp $exp_id on GPU $gpu_id: $exp_name"
+
+  # Convert boolean values to lowercase for Python
+  local mean_var_flag=""
+  local consistency_flag=""
+  local warmup_flag=""
+  local lr_decay_flag=""
+  
+  if [[ "$mean_var" == "True" ]]; then
+    mean_var_flag="--mean_variance_net"
+  fi
+  
+  if [[ "$consistency" == "True" ]]; then
+    consistency_flag="--use_consistency"
+  fi
+  
+  if [[ "$sched" == "True" ]]; then
+    warmup_flag="--use_warmup"
+    lr_decay_flag="--use_lr_decay"
+  fi
 
   CUDA_VISIBLE_DEVICES="$gpu_id" python "$TRAIN_SCRIPT" \
     --num_train_steps "$STEPS" \
     --batch_size "$BATCH" \
     --image_size "$IMSIZE" \
     --num_workers "$WORKERS" \
-    --mean_variance_net "$mean_var" \
-    --use_consistency "$consistency" \
-    --use_warmup "$sched" \
-    --use_lr_decay "$sched" \
-    --results_folder "results_${exp_name}" \
-    --checkpoints_folder "checkpoints_${exp_name}" \
+    $mean_var_flag \
+    $consistency_flag \
+    $warmup_flag \
+    $lr_decay_flag \
+    --results_folder "results/${exp_name}" \
+    --checkpoints_folder "checkpoints/${exp_name}" \
+    --use_wandb \
     --wandb_run_name "$exp_name" \
-    > "$log_file" 2>&1 &
-
-  # Return the PID
-  echo $!
+    --prefetch_factor 8 \
+    --persistent_workers &
 }
 
 ########################
 # Main experiment loop #
 ########################
 log "Starting training options comparison with $GPUS GPUs"
-log "Logs: $OUT_DIR"
+log "Using wandb for logging - no local log files"
 
 # Define experiments: (mean_var, consistency, sched)
 experiments=(
@@ -102,8 +112,10 @@ gpu_idx=0
 
 for i in "${!experiments[@]}"; do
   exp_params="${experiments[$i]}"
-  pid=$(run_experiment "$((i+1))" "$gpu_idx" $exp_params)
-  pids+=("$pid")
+  # Parse the parameters properly
+  read -r mean_var consistency sched <<< "$exp_params"
+  run_experiment "$((i+1))" "$gpu_idx" "$mean_var" "$consistency" "$sched" &
+  pids+=($!)
 
   gpu_idx=$(( (gpu_idx + 1) % GPUS ))
 done
@@ -121,25 +133,9 @@ log "All experiments completed!"
 # Summary              #
 ########################
 log "\n==== Comparison Summary ===="
-for i in "${!experiments[@]}"; do
-  exp_params="${experiments[$i]}"
-  # Parse parameters
-  read -r mean_var consistency sched <<< "$exp_params"
-  exp_name="exp_$((i+1))_mv${mean_var}_cons${consistency}_sched${sched}"
-  log_file="$OUT_DIR/${exp_name}.log"
-
-  if [[ -f "$log_file" ]]; then
-    # Extract final loss from log
-    final_loss=$(grep "loss:" "$log_file" | tail -n1 | sed 's/.*loss: \([0-9.]*\).*/\1/')
-    if [[ -n "$final_loss" ]]; then
-      echo "Experiment $((i+1)): $exp_params -> Final loss: $final_loss"
-    else
-      echo "Experiment $((i+1)): $exp_params -> No loss found"
-    fi
-  else
-    echo "Experiment $((i+1)): $exp_params -> Log file missing"
-  fi
-done
+log "All experiments have been launched with wandb logging enabled."
+log "Monitor progress at: https://wandb.ai"
+log "Project: rectified-flow-comparison"
 
 cat << 'EOF'
 
@@ -153,5 +149,5 @@ Experiment configurations:
 7. mean_var + consistency: mean_var + consistency
 8. all: mean_var + consistency + warmup + lr_decay
 
-All logs and results saved under comparison_logs/<timestamp>.
+Results and logs are available in wandb: rectified-flow-comparison project.
 EOF
