@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from copy import deepcopy
 from collections import namedtuple
 from typing import Literal, Callable
@@ -25,6 +26,8 @@ from einops.layers.torch import Rearrange
 from hyper_connections.hyper_connections_channel_first import get_init_and_expand_reduce_stream_functions, Residual
 
 from scipy.optimize import linear_sum_assignment
+
+from tqdm import tqdm
 
 from rectified_flow_pytorch.nano_flow import NanoFlow
 
@@ -961,7 +964,12 @@ class Trainer(Module):
         accelerate_kwargs: dict = dict(),
         ema_kwargs: dict = dict(),
         use_ema = True,
-        max_grad_norm = 0.5
+        max_grad_norm = 0.5,
+        use_wandb = False,
+        wandb_project = 'rectified-flow',
+        wandb_run_name = None,
+        wandb_kwargs: dict = dict(),
+        config = None
     ):
         super().__init__()
         self.accelerator = Accelerator(**accelerate_kwargs)
@@ -994,7 +1002,8 @@ class Trainer(Module):
         # optimizer, dataloader, and all that
 
         self.optimizer = Adam(rectified_flow.parameters(), lr = learning_rate, **adam_kwargs)
-        self.dl = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = True)
+        num_workers = getattr(config, 'num_workers', 4) if config else 4
+        self.dl = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = True, num_workers = num_workers, pin_memory = True)
 
         self.model, self.optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.dl)
 
@@ -1022,6 +1031,41 @@ class Trainer(Module):
         assert self.results_folder.is_dir()
 
         self.max_grad_norm = max_grad_norm
+
+        self.use_wandb = use_wandb
+        self.wandb_project = wandb_project
+        self.wandb_run_name = wandb_run_name
+        self.wandb_kwargs = wandb_kwargs
+        self.config = config
+
+        # Store data shape for sampling (avoid dataloader access during sampling)
+        self.data_shape = None
+
+        # Profiling setup
+        self.enable_profiling = os.environ.get('RECTIFIED_FLOW_PROFILE', '0') == '1'
+        if self.enable_profiling:
+            from .training_profiler import start_training_profiling
+            start_training_profiling(log_every=50)
+
+        self.init_wandb()
+
+    def init_wandb(self):
+        """Initialize Weights & Biases logging if enabled."""
+        if self.is_main and self.use_wandb:
+            import wandb
+            # Prepare config for wandb logging
+            wandb_config = {}
+            if self.config is not None:
+                # Convert dataclass to dict for wandb
+                if hasattr(self.config, '__dict__'):
+                    wandb_config = vars(self.config)
+                elif hasattr(self.config, '__annotations__'):
+                    # Handle dataclass
+                    wandb_config = {k: getattr(self.config, k) for k in self.config.__annotations__}
+                else:
+                    wandb_config = dict(self.config) if hasattr(self.config, 'items') else {}
+            
+            wandb.init(project=self.wandb_project, name=self.wandb_run_name, config=wandb_config, **self.wandb_kwargs)
 
     @property
     def is_main(self):
@@ -1057,9 +1101,10 @@ class Trainer(Module):
 
     def sample(self, fname):
         eval_model = default(self.ema_model, self.model)
-        dl = cycle(self.dl)
-        mock_data = next(dl)
-        data_shape = mock_data.shape[1:]
+        
+        # Use stored data_shape instead of accessing dataloader
+        assert self.data_shape is not None, "data_shape not set. Run at least one training step first."
+        data_shape = self.data_shape
 
         additional_sample_kwargs = dict()
         if isinstance(eval_model.model, RectifiedFlow):
@@ -1082,47 +1127,184 @@ class Trainer(Module):
 
         dl = cycle(self.dl)
 
+        # Create progress bar on main process
+        if self.accelerator.is_main_process:
+            pbar = tqdm(total=self.num_train_steps, desc='Training', unit='step')
+        else:
+            pbar = None
+
         for ind in range(self.num_train_steps):
             step = ind + 1
 
             self.model.train()
 
-            data = next(dl)
-
-            if self.return_loss_breakdown:
-                loss, loss_breakdown = self.model(data, return_loss_breakdown = True)
-                self.log(loss_breakdown._asdict(), step = step)
+            # Profile data loading
+            if self.enable_profiling:
+                from .training_profiler import profile_data_loading
+                with profile_data_loading():
+                    data = next(dl)
             else:
-                loss = self.model(data)
+                data = next(dl)
 
-            self.accelerator.print(f'[{step}] loss: {loss.item():.3f}')
-            self.accelerator.backward(loss)
+            # Profile forward pass
+            if self.enable_profiling:
+                from .training_profiler import profile_forward_pass
+                with profile_forward_pass():
+                    if self.return_loss_breakdown:
+                        loss, loss_breakdown = self.model(data, return_loss_breakdown = True)
+                        self.log(loss_breakdown._asdict(), step = step)
+                    else:
+                        loss = self.model(data)
+            else:
+                if self.return_loss_breakdown:
+                    loss, loss_breakdown = self.model(data, return_loss_breakdown = True)
+                    self.log(loss_breakdown._asdict(), step = step)
+                else:
+                    loss = self.model(data)
+
+            # Store data shape for sampling (only once)
+            if self.data_shape is None:
+                self.data_shape = data.shape[1:]
+
+            # Profile backward pass
+            if self.enable_profiling:
+                from .training_profiler import profile_backward_pass
+                with profile_backward_pass():
+                    self.accelerator.backward(loss)
+            else:
+                self.accelerator.backward(loss)
+
+            # Update progress bar after backward pass (when gradients are available)
+            if self.accelerator.is_main_process:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                # Compute grad_norm and param_norm for display and logging (on CPU to avoid GPU utilization drops)
+                if self.enable_profiling:
+                    from .training_profiler import profile_metrics_computation
+                    with profile_metrics_computation():
+                        unwrapped_model = self.accelerator.unwrap_model(self.model)
+                        grad_sq_sum = torch.tensor(0.)
+                        param_sq_sum = torch.tensor(0.)
+                        for p in unwrapped_model.parameters():
+                            if p.grad is not None:
+                                grad_sq_sum += (p.grad.detach().cpu() ** 2).sum()
+                            param_sq_sum += (p.detach().cpu() ** 2).sum()
+                        grad_norm = torch.sqrt(grad_sq_sum)
+                        param_norm = torch.sqrt(param_sq_sum)
+                else:
+                    unwrapped_model = self.accelerator.unwrap_model(self.model)
+                    grad_sq_sum = torch.tensor(0.)
+                    param_sq_sum = torch.tensor(0.)
+                    for p in unwrapped_model.parameters():
+                        if p.grad is not None:
+                            grad_sq_sum += (p.grad.detach().cpu() ** 2).sum()
+                        param_sq_sum += (p.detach().cpu() ** 2).sum()
+                    grad_norm = torch.sqrt(grad_sq_sum)
+                    param_norm = torch.sqrt(param_sq_sum)
+            
+                # Update progress bar after backward pass (when gradients are available)
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'lr': f'{current_lr:.2e}',
+                    'grad_norm': f'{grad_norm.item():.2f}',
+                    'param_norm': f'{param_norm.item():.2f}'
+                })
+                pbar.update(1)
+
+                if self.use_wandb:
+                    import wandb
+                    log_dict = {
+                        'loss': loss.item(),
+                        'learning_rate': self.optimizer.param_groups[0]['lr'],
+                        'grad_norm': grad_norm.item(),
+                        'param_norm': param_norm.item(),
+                    }
+                    if self.return_loss_breakdown:
+                        log_dict.update(loss_breakdown._asdict())
+                    wandb.log(log_dict, step=step)
 
             self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+            # Profile optimizer step
+            if self.enable_profiling:
+                from .training_profiler import profile_optimizer_step
+                with profile_optimizer_step():
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+            else:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
-            if getattr(self.model, 'use_consistency', False):
-                self.model.ema_model.update()
+            # Profile EMA updates
+            if self.enable_profiling:
+                from .training_profiler import profile_ema_update
+                with profile_ema_update():
+                    if getattr(self.model, 'use_consistency', False):
+                        self.model.ema_model.update()
 
-            if self.is_main and self.use_ema:
-                self.ema_model.ema_model.data_shape = self.model.data_shape
-                self.ema_model.update()
+                    if self.is_main and self.use_ema:
+                        # Always unwrap the model to access data_shape safely
+                        unwrapped_model = self.accelerator.unwrap_model(self.model)
+                        data_shape = self.data_shape  # Use stored data_shape
+                        self.ema_model.ema_model.data_shape = data_shape
+                        self.ema_model.update()
+            else:
+                if getattr(self.model, 'use_consistency', False):
+                    self.model.ema_model.update()
+
+                if self.is_main and self.use_ema:
+                    # Always unwrap the model to access data_shape safely
+                    unwrapped_model = self.accelerator.unwrap_model(self.model)
+                    data_shape = self.data_shape  # Use stored data_shape
+                    self.ema_model.ema_model.data_shape = data_shape
+                    self.ema_model.update()
 
             self.accelerator.wait_for_everyone()
 
-            if self.is_main:
+            if self.accelerator.is_main_process:
 
                 if divisible_by(step, self.save_results_every):
-
-                    sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'))
+                    # Profile sampling
+                    if self.enable_profiling:
+                        from .training_profiler import profile_sampling
+                        with profile_sampling():
+                            sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'))
+                    else:
+                        sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'))
 
                     self.log_images(sampled, step = step)
 
+                    # Log images to wandb if enabled
+                    if self.use_wandb:
+                        import wandb
+                        from torchvision.transforms import ToPILImage
+
+                        # Convert tensor to PIL Image for wandb logging
+                        to_pil = ToPILImage()
+                        pil_image = to_pil(sampled.cpu())
+
+                        # Log to wandb
+                        wandb.log({
+                            "generated_images": wandb.Image(pil_image, caption=f"Step {step}")
+                        }, step=step)
+
                 if divisible_by(step, self.checkpoint_every):
-                    self.save(f'checkpoint.{step}.pt')
+                    # Profile checkpointing
+                    if self.enable_profiling:
+                        from .training_profiler import profile_checkpointing
+                        with profile_checkpointing():
+                            self.save(f'checkpoint.{step}.pt')
+                    else:
+                        self.save(f'checkpoint.{step}.pt')
 
             self.accelerator.wait_for_everyone()
+
+        # Close progress bar
+        if self.accelerator.is_main_process and pbar is not None:
+            pbar.close()
+
+        # End profiling and print summary
+        if self.enable_profiling:
+            from .training_profiler import end_training_profiling
+            end_training_profiling()
 
         print('training complete')
