@@ -23,7 +23,10 @@ import einx
 from einops import einsum, reduce, rearrange, repeat
 from einops.layers.torch import Rearrange
 
-from hyper_connections.hyper_connections_channel_first import get_init_and_expand_reduce_stream_functions, Residual
+from hyper_connections.hyper_connections_channel_first import (
+    get_init_and_expand_reduce_stream_functions,
+    Residual,
+)
 
 from scipy.optimize import linear_sum_assignment
 
@@ -33,36 +36,48 @@ from rectified_flow_pytorch.nano_flow import NanoFlow
 
 # helpers
 
+
 def exists(v):
     return v is not None
+
 
 def default(v, d):
     return v if exists(v) else d
 
+
 def identity(t):
     return t
 
+
 # tensor helpers
+
 
 def append_dims(t, ndims):
     shape = t.shape
     return t.reshape(*shape, *((1,) * ndims))
 
+
 # normalizing helpers
+
 
 def normalize_to_neg_one_to_one(img):
     return img * 2 - 1
 
+
 def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
 
+
 # noise schedules
+
 
 def cosmap(t):
     # Algorithm 21 in https://arxiv.org/abs/2403.03206
-    return 1. - (1. / (torch.tan(pi / 2 * t) + 1))
+    return 1.0 - (1.0 / (torch.tan(pi / 2 * t) + 1))
+
 
 # losses
+
 
 class LPIPSLoss(Module):
     def __init__(
@@ -73,39 +88,41 @@ class LPIPSLoss(Module):
         super().__init__()
 
         if not exists(vgg):
-            vgg = torchvision.models.vgg16(weights = vgg_weights)
+            vgg = torchvision.models.vgg16(weights=vgg_weights)
             vgg.classifier = nn.Sequential(*vgg.classifier[:-2])
 
         self.vgg = [vgg]
 
-    def forward(self, pred_data, data, reduction = 'mean'):
-        vgg, = self.vgg
+    def forward(self, pred_data, data, reduction="mean"):
+        (vgg,) = self.vgg
         vgg = vgg.to(data.device)
 
         pred_embed, embed = map(vgg, (pred_data, data))
 
-        loss = F.mse_loss(embed, pred_embed, reduction = reduction)
+        loss = F.mse_loss(embed, pred_embed, reduction=reduction)
 
-        if reduction == 'none':
-            loss = reduce(loss, 'b ... -> b', 'mean')
+        if reduction == "none":
+            loss = reduce(loss, "b ... -> b", "mean")
 
         return loss
+
 
 class PseudoHuberLoss(Module):
     def __init__(self, data_dim: int = 3):
         super().__init__()
         self.data_dim = data_dim
 
-    def forward(self, pred, target, reduction = 'mean', **kwargs):
-        data_dim = default(self.data_dim, kwargs.pop('data_dim', None))
+    def forward(self, pred, target, reduction="mean", **kwargs):
+        data_dim = default(self.data_dim, kwargs.pop("data_dim", None))
 
-        c = .00054 * self.data_dim
-        loss = (F.mse_loss(pred, target, reduction = reduction) + c * c).sqrt() - c
+        c = 0.00054 * self.data_dim
+        loss = (F.mse_loss(pred, target, reduction=reduction) + c * c).sqrt() - c
 
-        if reduction == 'none':
-            loss = reduce(loss, 'b ... -> b', 'mean')
+        if reduction == "none":
+            loss = reduce(loss, "b ... -> b", "mean")
 
         return loss
+
 
 class PseudoHuberLossWithLPIPS(Module):
     def __init__(self, data_dim: int = 3, lpips_kwargs: dict = dict()):
@@ -114,63 +131,62 @@ class PseudoHuberLossWithLPIPS(Module):
         self.lpips = LPIPSLoss(**lpips_kwargs)
 
     def forward(self, pred_flow, target_flow, *, pred_data, times, data):
-        huber_loss = self.pseudo_huber(pred_flow, target_flow, reduction = 'none')
-        lpips_loss = self.lpips(data, pred_data, reduction = 'none')
+        huber_loss = self.pseudo_huber(pred_flow, target_flow, reduction="none")
+        lpips_loss = self.lpips(data, pred_data, reduction="none")
 
-        time_weighted_loss = huber_loss * (1 - times) + lpips_loss * (1. / times.clamp(min = 1e-1))
+        time_weighted_loss = huber_loss * (1 - times) + lpips_loss * (
+            1.0 / times.clamp(min=1e-1)
+        )
         return time_weighted_loss.mean()
+
 
 class MSELoss(Module):
     def forward(self, pred, target, **kwargs):
         return F.mse_loss(pred, target)
+
 
 class MeanVarianceNetLoss(Module):
     def forward(self, pred, target, **kwargs):
         dist = Normal(*pred)
         return -dist.log_prob(target).mean()
 
+
 # loss breakdown
 
-LossBreakdown = namedtuple('LossBreakdown', ['total', 'main', 'data_match', 'velocity_match'])
+LossBreakdown = namedtuple(
+    "LossBreakdown", ["total", "main", "data_match", "velocity_match"]
+)
 
 # main class
+
 
 class RectifiedFlow(Module):
     def __init__(
         self,
         model: dict | Module,
         mean_variance_net: bool | None = None,
-        time_cond_kwarg: str | None = 'times',
-        odeint_kwargs: dict = dict(
-            atol = 1e-5,
-            rtol = 1e-5,
-            method = 'midpoint'
-        ),
-        predict: Literal['flow', 'noise'] = 'flow',
-        loss_fn: Literal[
-            'mse',
-            'pseudo_huber',
-            'pseudo_huber_with_lpips'
-        ] | Module = 'mse',
-        noise_schedule: Literal[
-            'cosmap'
-        ] | Callable = identity,
+        time_cond_kwarg: str | None = "times",
+        odeint_kwargs: dict = dict(atol=1e-5, rtol=1e-5, method="midpoint"),
+        predict: Literal["flow", "noise"] = "flow",
+        loss_fn: Literal["mse", "pseudo_huber", "pseudo_huber_with_lpips"]
+        | Module = "mse",
+        noise_schedule: Literal["cosmap"] | Callable = identity,
         loss_fn_kwargs: dict = dict(),
         ema_update_after_step: int = 100,
         ema_kwargs: dict = dict(),
         data_shape: tuple[int, ...] | None = None,
-        immiscible = False,
-        use_consistency = False,
-        consistency_decay = 0.9999,
-        consistency_velocity_match_alpha = 1e-5,
-        consistency_delta_time = 1e-3,
-        consistency_loss_weight = 1.,
-        data_normalize_fn = normalize_to_neg_one_to_one,
-        data_unnormalize_fn = unnormalize_to_zero_to_one,
-        clip_during_sampling = False,
-        clip_values: tuple[float, float] = (-1., 1.),
-        clip_flow_during_sampling = None, # this seems to help a lot when training with predict epsilon, at least for me
-        clip_flow_values: tuple[float, float] = (-3., 3)
+        immiscible=False,
+        use_consistency=False,
+        consistency_decay=0.9999,
+        consistency_velocity_match_alpha=1e-5,
+        consistency_delta_time=1e-3,
+        consistency_loss_weight=1.0,
+        data_normalize_fn=normalize_to_neg_one_to_one,
+        data_unnormalize_fn=unnormalize_to_zero_to_one,
+        clip_during_sampling=False,
+        clip_values: tuple[float, float] = (-1.0, 1.0),
+        clip_flow_during_sampling=None,  # this seems to help a lot when training with predict epsilon, at least for me
+        clip_flow_values: tuple[float, float] = (-3.0, 3),
     ):
         super().__init__()
 
@@ -178,12 +194,19 @@ class RectifiedFlow(Module):
             model = Unet(**model)
 
         self.model = model
-        self.time_cond_kwarg = time_cond_kwarg # whether the model is to be conditioned on the times
+        self.time_cond_kwarg = (
+            time_cond_kwarg  # whether the model is to be conditioned on the times
+        )
 
         # allow for mean variance output prediction
 
         if not exists(mean_variance_net):
-            mean_variance_net = default(model.mean_variance_net if isinstance(model, Unet) else mean_variance_net, False)
+            mean_variance_net = default(
+                model.mean_variance_net
+                if isinstance(model, Unet)
+                else mean_variance_net,
+                False,
+            )
 
         self.mean_variance_net = mean_variance_net
 
@@ -196,36 +219,38 @@ class RectifiedFlow(Module):
 
         # automatically default to a working setting for predict epsilon
 
-        clip_flow_during_sampling = default(clip_flow_during_sampling, predict == 'noise')
+        clip_flow_during_sampling = default(
+            clip_flow_during_sampling, predict == "noise"
+        )
 
         # loss fn
 
-        if loss_fn == 'mse':
+        if loss_fn == "mse":
             loss_fn = MSELoss()
 
-        elif loss_fn == 'pseudo_huber':
-            assert predict == 'flow'
+        elif loss_fn == "pseudo_huber":
+            assert predict == "flow"
 
             # section 4.2 of https://arxiv.org/abs/2405.20320v1
             loss_fn = PseudoHuberLoss(**loss_fn_kwargs)
 
-        elif loss_fn == 'pseudo_huber_with_lpips':
-            assert predict == 'flow'
+        elif loss_fn == "pseudo_huber_with_lpips":
+            assert predict == "flow"
 
             loss_fn = PseudoHuberLossWithLPIPS(**loss_fn_kwargs)
 
         elif not isinstance(loss_fn, Module):
-            raise ValueError(f'unknown loss function {loss_fn}')
+            raise ValueError(f"unknown loss function {loss_fn}")
 
         self.loss_fn = loss_fn
 
         # noise schedules
 
-        if noise_schedule == 'cosmap':
+        if noise_schedule == "cosmap":
             noise_schedule = cosmap
 
         elif not callable(noise_schedule):
-            raise ValueError(f'unknown noise schedule {noise_schedule}')
+            raise ValueError(f"unknown noise schedule {noise_schedule}")
 
         self.noise_schedule = noise_schedule
 
@@ -253,10 +278,10 @@ class RectifiedFlow(Module):
         if use_consistency:
             self.ema_model = EMA(
                 model,
-                beta = consistency_decay,
-                update_after_step = ema_update_after_step,
-                include_online_model = False,
-                **ema_kwargs
+                beta=consistency_decay,
+                update_after_step=ema_update_after_step,
+                include_online_model=False,
+                **ema_kwargs,
             )
 
         # immiscible diffusion paper, will be removed if does not work
@@ -272,7 +297,7 @@ class RectifiedFlow(Module):
     def device(self):
         return next(self.model.parameters()).device
 
-    def predict_flow(self, model: Module, noised, *, times, eps = 1e-10, **model_kwargs):
+    def predict_flow(self, model: Module, noised, *, times, eps=1e-10, **model_kwargs):
         """
         returns the model output as well as the derived flow, depending on the `predict` objective
         """
@@ -284,10 +309,10 @@ class RectifiedFlow(Module):
         time_kwarg = self.time_cond_kwarg
 
         if exists(time_kwarg):
-            times = rearrange(times, '... -> (...)')
+            times = rearrange(times, "... -> (...)")
 
             if times.numel() == 1:
-                times = repeat(times, '1 -> b', b = batch)
+                times = repeat(times, "1 -> b", b=batch)
 
             model_kwargs.update(**{time_kwarg: times})
 
@@ -295,33 +320,35 @@ class RectifiedFlow(Module):
 
         # depending on objective, derive flow
 
-        if self.predict == 'flow':
+        if self.predict == "flow":
             flow = output
 
-        elif self.predict == 'noise':
+        elif self.predict == "noise":
             noise = output
             padded_times = append_dims(times, noised.ndim - 1)
 
-            flow = (noised - noise) / padded_times.clamp(min = eps)
+            flow = (noised - noise) / padded_times.clamp(min=eps)
 
         else:
-            raise ValueError(f'unknown objective {self.predict}')
+            raise ValueError(f"unknown objective {self.predict}")
 
         return output, flow
 
     @torch.no_grad()
     def sample(
         self,
-        batch_size = 1,
-        steps = 16,
-        noise = None,
+        batch_size=1,
+        steps=16,
+        noise=None,
         data_shape: tuple[int, ...] | None = None,
-        temperature: float = 1.,
+        temperature: float = 1.0,
         use_ema: bool = False,
-        **model_kwargs
+        **model_kwargs,
     ):
         use_ema = default(use_ema, self.use_consistency)
-        assert not (use_ema and not self.use_consistency), 'in order to sample from an ema model, you must have `use_consistency` turned on'
+        assert not (use_ema and not self.use_consistency), (
+            "in order to sample from an ema model, you must have `use_consistency` turned on"
+        )
 
         model = self.ema_model if use_ema else self.model
 
@@ -329,28 +356,38 @@ class RectifiedFlow(Module):
         self.eval()
 
         data_shape = default(data_shape, self.data_shape)
-        assert exists(data_shape), 'you need to either pass in a `data_shape` or have trained at least with one forward'
+        assert exists(data_shape), (
+            "you need to either pass in a `data_shape` or have trained at least with one forward"
+        )
 
         # clipping still helps for predict noise objective
         # much like original ddpm paper trick
 
-        maybe_clip = (lambda t: t.clamp_(*self.clip_values)) if self.clip_during_sampling else identity
+        maybe_clip = (
+            (lambda t: t.clamp_(*self.clip_values))
+            if self.clip_during_sampling
+            else identity
+        )
 
-        maybe_clip_flow = (lambda t: t.clamp_(*self.clip_flow_values)) if self.clip_flow_during_sampling else identity
+        maybe_clip_flow = (
+            (lambda t: t.clamp_(*self.clip_flow_values))
+            if self.clip_flow_during_sampling
+            else identity
+        )
 
         # ode step function
 
         def ode_fn(t, x):
             x = maybe_clip(x)
 
-            _, output = self.predict_flow(model, x, times = t, **model_kwargs)
+            _, output = self.predict_flow(model, x, times=t, **model_kwargs)
 
             flow = output
 
             if self.mean_variance_net:
                 mean, variance = output
 
-                std = variance.clamp(min = 1e-5).sqrt()
+                std = variance.clamp(min=1e-5).sqrt()
 
                 flow = torch.normal(mean, std * temperature)
 
@@ -360,11 +397,13 @@ class RectifiedFlow(Module):
 
         # start with random gaussian noise - y0
 
-        noise = default(noise, torch.randn((batch_size, *data_shape), device = self.device))
+        noise = default(
+            noise, torch.randn((batch_size, *data_shape), device=self.device)
+        )
 
         # time steps
 
-        times = torch.linspace(0., 1., steps, device = self.device)
+        times = torch.linspace(0.0, 1.0, steps, device=self.device)
 
         # ode
 
@@ -380,8 +419,8 @@ class RectifiedFlow(Module):
         self,
         data,
         noise: Tensor | None = None,
-        return_loss_breakdown = False,
-        **model_kwargs
+        return_loss_breakdown=False,
+        **model_kwargs,
     ):
         batch, *data_shape = data.shape
 
@@ -402,16 +441,15 @@ class RectifiedFlow(Module):
 
         # times, and times with dimension padding on right
 
-        times = torch.rand(batch, device = self.device)
+        times = torch.rand(batch, device=self.device)
         padded_times = append_dims(times, data.ndim - 1)
 
         # time needs to be from [0, 1 - delta_time] if using consistency loss
 
         if self.use_consistency:
-            padded_times *= 1. - self.consistency_delta_time
+            padded_times *= 1.0 - self.consistency_delta_time
 
         def get_noised_and_flows(model, t):
-
             # maybe noise schedule
 
             t = self.noise_schedule(t)
@@ -420,13 +458,15 @@ class RectifiedFlow(Module):
             # linear interpolation of noise with data using random times
             # x1 * t + x0 * (1 - t) - so from noise (time = 0) to data (time = 1.)
 
-            noised = noise.lerp(data, t) # noise -> data from 0. to 1.
+            noised = noise.lerp(data, t)  # noise -> data from 0. to 1.
 
             # the model predicts the flow from the noised data
 
             flow = data - noise
 
-            model_output, model_output = self.predict_flow(model, noised, times = t, **model_kwargs)
+            model_output, model_output = self.predict_flow(
+                model, noised, times=t, **model_kwargs
+            )
 
             # if mean variance network, sample from normal
 
@@ -438,34 +478,40 @@ class RectifiedFlow(Module):
 
             # predicted data will be the noised xt + flow * (1. - t)
 
-            pred_data = noised + pred_flow * (1. - t)
+            pred_data = noised + pred_flow * (1.0 - t)
 
             return model_output, flow, pred_flow, pred_data
 
         # getting flow and pred flow for main model
 
-        output, flow, pred_flow, pred_data = get_noised_and_flows(self.model, padded_times)
+        output, flow, pred_flow, pred_data = get_noised_and_flows(
+            self.model, padded_times
+        )
 
         # if using consistency loss, also need the ema model predicted flow
 
         if self.use_consistency:
             delta_t = self.consistency_delta_time
-            ema_output, ema_flow, ema_pred_flow, ema_pred_data = get_noised_and_flows(self.ema_model, padded_times + delta_t)
+            ema_output, ema_flow, ema_pred_flow, ema_pred_data = get_noised_and_flows(
+                self.ema_model, padded_times + delta_t
+            )
 
         # determine target, depending on objective
 
-        if self.predict == 'flow':
+        if self.predict == "flow":
             target = flow
-        elif self.predict == 'noise':
+        elif self.predict == "noise":
             target = noise
         else:
-            raise ValueError(f'unknown objective {self.predict}')
+            raise ValueError(f"unknown objective {self.predict}")
 
         # losses
 
-        main_loss = self.loss_fn(output, target, pred_data = pred_data, times = times, data = data)
+        main_loss = self.loss_fn(
+            output, target, pred_data=pred_data, times=times, data=data
+        )
 
-        consistency_loss = data_match_loss = velocity_match_loss = 0.
+        consistency_loss = data_match_loss = velocity_match_loss = 0.0
 
         if self.use_consistency:
             # consistency losses from consistency fm paper - eq (6) in https://arxiv.org/html/2407.02398v1
@@ -473,7 +519,10 @@ class RectifiedFlow(Module):
             data_match_loss = F.mse_loss(pred_data, ema_pred_data)
             velocity_match_loss = F.mse_loss(pred_flow, ema_pred_flow)
 
-            consistency_loss = data_match_loss + velocity_match_loss * self.consistency_velocity_match_alpha
+            consistency_loss = (
+                data_match_loss
+                + velocity_match_loss * self.consistency_velocity_match_alpha
+            )
 
         # total loss
 
@@ -484,43 +533,53 @@ class RectifiedFlow(Module):
 
         # loss breakdown
 
-        return total_loss, LossBreakdown(total_loss, main_loss, data_match_loss, velocity_match_loss)
+        return total_loss, LossBreakdown(
+            total_loss, main_loss, data_match_loss, velocity_match_loss
+        )
+
 
 # unet
 
 from functools import partial
 
-def cast_tuple(t, length = 1):
+
+def cast_tuple(t, length=1):
     return t if isinstance(t, tuple) else ((t,) * length)
+
 
 def divisible_by(num, den):
     return (num % den) == 0
 
-def Upsample(dim, dim_out = None):
+
+def Upsample(dim, dim_out=None):
     return nn.Sequential(
-        nn.Upsample(scale_factor = 2, mode = 'nearest'),
-        nn.Conv2d(dim, default(dim_out, dim), 3, padding = 1)
+        nn.Upsample(scale_factor=2, mode="nearest"),
+        nn.Conv2d(dim, default(dim_out, dim), 3, padding=1),
     )
 
-def Downsample(dim, dim_out = None):
+
+def Downsample(dim, dim_out=None):
     return nn.Sequential(
-        Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
-        nn.Conv2d(dim * 4, default(dim_out, dim), 1)
+        Rearrange("b c (h p1) (w p2) -> b (c p1 p2) h w", p1=2, p2=2),
+        nn.Conv2d(dim * 4, default(dim_out, dim), 1),
     )
+
 
 class RMSNorm(Module):
     def __init__(self, dim):
         super().__init__()
-        self.scale = dim ** 0.5
+        self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.zeros(dim, 1, 1))
 
     def forward(self, x):
-        return F.normalize(x, dim = 1) * (self.gamma + 1) * self.scale
+        return F.normalize(x, dim=1) * (self.gamma + 1) * self.scale
+
 
 # sinusoidal positional embeds
 
+
 class SinusoidalPosEmb(Module):
-    def __init__(self, dim, theta = 10000):
+    def __init__(self, dim, theta=10000):
         super().__init__()
         self.dim = dim
         self.theta = theta
@@ -530,33 +589,35 @@ class SinusoidalPosEmb(Module):
         half_dim = self.dim // 2
         emb = math.log(self.theta) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = einx.multiply('i, j -> i j', x, emb)
+        emb = einx.multiply("i, j -> i j", x, emb)
         emb = cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
+
 class RandomOrLearnedSinusoidalPosEmb(Module):
-    def __init__(self, dim, is_random = False):
+    def __init__(self, dim, is_random=False):
         super().__init__()
         assert divisible_by(dim, 2)
         half_dim = dim // 2
-        self.weights = nn.Parameter(torch.randn(half_dim), requires_grad = not is_random)
+        self.weights = nn.Parameter(torch.randn(half_dim), requires_grad=not is_random)
 
     def forward(self, x):
-        x = rearrange(x, 'b -> b 1')
-        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
-        fouriered = cat((freqs.sin(), freqs.cos()), dim = -1)
-        fouriered = cat((x, fouriered), dim = -1)
+        x = rearrange(x, "b -> b 1")
+        freqs = x * rearrange(self.weights, "d -> 1 d") * 2 * math.pi
+        fouriered = cat((freqs.sin(), freqs.cos()), dim=-1)
+        fouriered = cat((x, fouriered), dim=-1)
         return fouriered
 
+
 class Block(Module):
-    def __init__(self, dim, dim_out, dropout = 0.):
+    def __init__(self, dim, dim_out, dropout=0.0):
         super().__init__()
-        self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
+        self.proj = nn.Conv2d(dim, dim_out, 3, padding=1)
         self.norm = RMSNorm(dim_out)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, scale_shift = None):
+    def forward(self, x, scale_shift=None):
         x = x.contiguous()
         x = self.proj(x)
         x = self.norm(x)
@@ -568,139 +629,132 @@ class Block(Module):
         x = self.act(x)
         return self.dropout(x)
 
-class ResnetBlock(Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim = None, dropout = 0.):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, dim_out * 2)
-        ) if exists(time_emb_dim) else None
 
-        self.block1 = Block(dim, dim_out, dropout = dropout)
+class ResnetBlock(Module):
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, dropout=0.0):
+        super().__init__()
+        self.mlp = (
+            nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out * 2))
+            if exists(time_emb_dim)
+            else None
+        )
+
+        self.block1 = Block(dim, dim_out, dropout=dropout)
         self.block2 = Block(dim_out, dim_out)
 
-    def forward(self, x, time_emb = None):
-
+    def forward(self, x, time_emb=None):
         scale_shift = None
         if exists(self.mlp) and exists(time_emb):
             time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, 'b c -> b c 1 1')
-            scale_shift = time_emb.chunk(2, dim = 1)
+            time_emb = rearrange(time_emb, "b c -> b c 1 1")
+            scale_shift = time_emb.chunk(2, dim=1)
 
-        h = self.block1(x, scale_shift = scale_shift)
+        h = self.block1(x, scale_shift=scale_shift)
 
         h = self.block2(h)
 
         return h
 
+
 class LinearAttention(Module):
-    def __init__(
-        self,
-        dim,
-        heads = 4,
-        dim_head = 32,
-        num_mem_kv = 4
-    ):
+    def __init__(self, dim, heads=4, dim_head=32, num_mem_kv=4):
         super().__init__()
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
         hidden_dim = dim_head * heads
 
         self.norm = RMSNorm(dim)
 
         self.mem_kv = nn.Parameter(torch.randn(2, heads, dim_head, num_mem_kv))
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
 
-        self.to_out = nn.Sequential(
-            nn.Conv2d(hidden_dim, dim, 1),
-            RMSNorm(dim)
-        )
+        self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1), RMSNorm(dim))
 
     def forward(self, x):
         b, c, h, w = x.shape
 
         x = self.norm(x)
 
-        qkv = self.to_qkv(x).chunk(3, dim = 1)
-        q, k, v = tuple(rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads) for t in qkv)
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = tuple(
+            rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads) for t in qkv
+        )
 
-        mk, mv = tuple(repeat(t, 'h c n -> b h c n', b = b) for t in self.mem_kv)
-        k, v = map(partial(cat, dim = -1), ((mk, k), (mv, v)))
+        mk, mv = tuple(repeat(t, "h c n -> b h c n", b=b) for t in self.mem_kv)
+        k, v = map(partial(cat, dim=-1), ((mk, k), (mv, v)))
 
-        q = q.softmax(dim = -2)
-        k = k.softmax(dim = -1)
+        q = q.softmax(dim=-2)
+        k = k.softmax(dim=-1)
 
         q = q * self.scale
 
-        context = einsum(k, v, 'b h d n, b h e n -> b h d e')
+        context = einsum(k, v, "b h d n, b h e n -> b h d e")
 
-        out = einsum(context, q, 'b h d e, b h d n -> b h e n')
-        out = rearrange(out, 'b h c (x y) -> b (h c) x y', h = self.heads, x = h, y = w)
+        out = einsum(context, q, "b h d e, b h d n -> b h e n")
+        out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
         return self.to_out(out)
 
+
 class Attention(Module):
-    def __init__(
-        self,
-        dim,
-        heads = 4,
-        dim_head = 32,
-        num_mem_kv = 4,
-        flash = False
-    ):
+    def __init__(self, dim, heads=4, dim_head=32, num_mem_kv=4, flash=False):
         super().__init__()
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
         hidden_dim = dim_head * heads
 
         self.norm = RMSNorm(dim)
 
         self.mem_kv = nn.Parameter(torch.randn(2, heads, num_mem_kv, dim_head))
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
-        self.to_out = nn.Conv2d(hidden_dim, dim, 1, bias = False)
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
+        self.to_out = nn.Conv2d(hidden_dim, dim, 1, bias=False)
 
     def forward(self, x):
         b, c, h, w = x.shape
 
         x = self.norm(x)
 
-        qkv = self.to_qkv(x).chunk(3, dim = 1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h (x y) c', h = self.heads), qkv)
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = map(
+            lambda t: rearrange(t, "b (h c) x y -> b h (x y) c", h=self.heads), qkv
+        )
 
-        mk, mv = map(lambda t: repeat(t, 'h n d -> b h n d', b = b), self.mem_kv)
-        k, v = map(partial(cat, dim = -2), ((mk, k), (mv, v)))
+        mk, mv = map(lambda t: repeat(t, "h n d -> b h n d", b=b), self.mem_kv)
+        k, v = map(partial(cat, dim=-2), ((mk, k), (mv, v)))
 
         q = q * self.scale
-        sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
+        sim = einsum(q, k, "b h i d, b h j d -> b h i j")
 
-        attn = sim.softmax(dim = -1)
-        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+        attn = sim.softmax(dim=-1)
+        out = einsum(attn, v, "b h i j, b h j d -> b h i d")
 
-        out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
+        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
         return self.to_out(out)
 
+
 # model
+
 
 class Unet(Module):
     def __init__(
         self,
         dim,
-        init_dim = None,
-        out_dim = None,
+        init_dim=None,
+        out_dim=None,
         dim_mults: tuple[int, ...] = (1, 2, 4, 8),
-        channels = 3,
-        mean_variance_net = False,
-        learned_sinusoidal_cond = False,
-        random_fourier_features = False,
-        learned_sinusoidal_dim = 16,
-        sinusoidal_pos_emb_theta = 10000,
-        dropout = 0.,
-        attn_dim_head = 32,
-        attn_heads = 4,
-        full_attn = None,    # defaults to full attention only for inner most layer
-        flash_attn = False,
-        num_residual_streams = 2,
-        accept_cond = False,
-        dim_cond = None
+        channels=3,
+        mean_variance_net=False,
+        learned_sinusoidal_cond=False,
+        random_fourier_features=False,
+        learned_sinusoidal_dim=16,
+        sinusoidal_pos_emb_theta=10000,
+        dropout=0.0,
+        attn_dim_head=32,
+        attn_heads=4,
+        full_attn=None,  # defaults to full attention only for inner most layer
+        flash_attn=False,
+        num_residual_streams=2,
+        accept_cond=False,
+        dim_cond=None,
     ):
         super().__init__()
 
@@ -709,7 +763,7 @@ class Unet(Module):
         self.channels = channels
 
         init_dim = default(init_dim, dim)
-        self.init_conv = nn.Conv2d(channels, init_dim, 7, padding = 3)
+        self.init_conv = nn.Conv2d(channels, init_dim, 7, padding=3)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
@@ -718,34 +772,40 @@ class Unet(Module):
 
         time_dim = dim * 4
 
-        self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
+        self.random_or_learned_sinusoidal_cond = (
+            learned_sinusoidal_cond or random_fourier_features
+        )
 
         if self.random_or_learned_sinusoidal_cond:
-            sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
+            sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(
+                learned_sinusoidal_dim, random_fourier_features
+            )
             fourier_dim = learned_sinusoidal_dim + 1
         else:
-            sinu_pos_emb = SinusoidalPosEmb(dim, theta = sinusoidal_pos_emb_theta)
+            sinu_pos_emb = SinusoidalPosEmb(dim, theta=sinusoidal_pos_emb_theta)
             fourier_dim = dim
 
         self.time_mlp = nn.Sequential(
             sinu_pos_emb,
             nn.Linear(fourier_dim, time_dim),
             nn.GELU(),
-            nn.Linear(time_dim, time_dim)
+            nn.Linear(time_dim, time_dim),
         )
 
         # additional cond mlp
 
         self.cond_mlp = None
         if accept_cond:
-            assert exists(dim_cond), f'`dim_cond` must be set on init'
+            assert exists(dim_cond), f"`dim_cond` must be set on init"
             first_dim = dim if dim_cond == 1 else dim_cond
 
             self.cond_mlp = nn.Sequential(
-                SinusoidalPosEmb(dim, theta = sinusoidal_pos_emb_theta) if dim_cond == 1 else nn.Identity(),
+                SinusoidalPosEmb(dim, theta=sinusoidal_pos_emb_theta)
+                if dim_cond == 1
+                else nn.Identity(),
                 nn.Linear(first_dim, time_dim),
                 nn.GELU(),
-                nn.Linear(time_dim, time_dim)
+                nn.Linear(time_dim, time_dim),
             )
 
         # attention
@@ -754,7 +814,7 @@ class Unet(Module):
             full_attn = (*((False,) * (len(dim_mults) - 1)), True)
 
         num_stages = len(dim_mults)
-        full_attn  = cast_tuple(full_attn, num_stages)
+        full_attn = cast_tuple(full_attn, num_stages)
         attn_heads = cast_tuple(attn_heads, num_stages)
         attn_dim_head = cast_tuple(attn_dim_head, num_stages)
 
@@ -762,13 +822,17 @@ class Unet(Module):
 
         # prepare blocks
 
-        FullAttention = partial(Attention, flash = flash_attn)
-        resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
+        FullAttention = partial(Attention, flash=flash_attn)
+        resnet_block = partial(ResnetBlock, time_emb_dim=time_dim, dropout=dropout)
 
         # hyper connections
 
-        init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
-        res_conv = partial(nn.Conv2d, kernel_size = 1, bias = False)
+        init_hyper_conn, self.expand_streams, self.reduce_streams = (
+            get_init_and_expand_reduce_stream_functions(
+                num_residual_streams, disable=num_residual_streams == 1
+            )
+        )
+        res_conv = partial(nn.Conv2d, kernel_size=1, bias=False)
 
         # layers
 
@@ -776,49 +840,105 @@ class Unet(Module):
         self.ups = ModuleList([])
         num_resolutions = len(in_out)
 
-        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(in_out, full_attn, attn_heads, attn_dim_head)):
+        for ind, (
+            (dim_in, dim_out),
+            layer_full_attn,
+            layer_attn_heads,
+            layer_attn_dim_head,
+        ) in enumerate(zip(in_out, full_attn, attn_heads, attn_dim_head)):
             is_last = ind >= (num_resolutions - 1)
 
             attn_klass = FullAttention if layer_full_attn else LinearAttention
 
-            self.downs.append(ModuleList([
-                Residual(branch = resnet_block(dim_in, dim_in)),
-                Residual(branch = resnet_block(dim_in, dim_in)),
-                Residual(branch = attn_klass(dim_in, dim_head = layer_attn_dim_head, heads = layer_attn_heads)),
-                Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
-            ]))
+            self.downs.append(
+                ModuleList(
+                    [
+                        Residual(branch=resnet_block(dim_in, dim_in)),
+                        Residual(branch=resnet_block(dim_in, dim_in)),
+                        Residual(
+                            branch=attn_klass(
+                                dim_in,
+                                dim_head=layer_attn_dim_head,
+                                heads=layer_attn_heads,
+                            )
+                        ),
+                        Downsample(dim_in, dim_out)
+                        if not is_last
+                        else nn.Conv2d(dim_in, dim_out, 3, padding=1),
+                    ]
+                )
+            )
 
         mid_dim = dims[-1]
-        self.mid_block1 = init_hyper_conn(dim = mid_dim, branch = resnet_block(mid_dim, mid_dim))
-        self.mid_attn = init_hyper_conn(dim = mid_dim, branch = FullAttention(mid_dim, heads = attn_heads[-1], dim_head = attn_dim_head[-1]))
-        self.mid_block2 = init_hyper_conn(dim = mid_dim, branch = resnet_block(mid_dim, mid_dim))
+        self.mid_block1 = init_hyper_conn(
+            dim=mid_dim, branch=resnet_block(mid_dim, mid_dim)
+        )
+        self.mid_attn = init_hyper_conn(
+            dim=mid_dim,
+            branch=FullAttention(
+                mid_dim, heads=attn_heads[-1], dim_head=attn_dim_head[-1]
+            ),
+        )
+        self.mid_block2 = init_hyper_conn(
+            dim=mid_dim, branch=resnet_block(mid_dim, mid_dim)
+        )
 
-        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
+        for ind, (
+            (dim_in, dim_out),
+            layer_full_attn,
+            layer_attn_heads,
+            layer_attn_dim_head,
+        ) in enumerate(
+            zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))
+        ):
             is_last = ind == (len(in_out) - 1)
 
             attn_klass = FullAttention if layer_full_attn else LinearAttention
 
-            self.ups.append(ModuleList([
-                Residual(branch = resnet_block(dim_out + dim_in, dim_out), residual_transform = res_conv(dim_out + dim_in, dim_out)),
-                Residual(branch = resnet_block(dim_out + dim_in, dim_out), residual_transform = res_conv(dim_out + dim_in, dim_out)),
-                Residual(branch = attn_klass(dim_out, dim_head = layer_attn_dim_head, heads = layer_attn_heads)),
-                Upsample(dim_out, dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
-            ]))
+            self.ups.append(
+                ModuleList(
+                    [
+                        Residual(
+                            branch=resnet_block(dim_out + dim_in, dim_out),
+                            residual_transform=res_conv(dim_out + dim_in, dim_out),
+                        ),
+                        Residual(
+                            branch=resnet_block(dim_out + dim_in, dim_out),
+                            residual_transform=res_conv(dim_out + dim_in, dim_out),
+                        ),
+                        Residual(
+                            branch=attn_klass(
+                                dim_out,
+                                dim_head=layer_attn_dim_head,
+                                heads=layer_attn_heads,
+                            )
+                        ),
+                        Upsample(dim_out, dim_in)
+                        if not is_last
+                        else nn.Conv2d(dim_out, dim_in, 3, padding=1),
+                    ]
+                )
+            )
 
         self.mean_variance_net = mean_variance_net
 
         default_out_dim = channels * (1 if not mean_variance_net else 2)
         self.out_dim = default(out_dim, default_out_dim)
 
-        self.final_res_block = Residual(branch = resnet_block(init_dim * 2, init_dim), residual_transform = res_conv(init_dim * 2, init_dim))
+        self.final_res_block = Residual(
+            branch=resnet_block(init_dim * 2, init_dim),
+            residual_transform=res_conv(init_dim * 2, init_dim),
+        )
         self.final_conv = nn.Conv2d(init_dim, self.out_dim, 1)
 
     @property
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, times, cond = None):
-        assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
+    def forward(self, x, times, cond=None):
+        assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), (
+            f"your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet"
+        )
 
         x = self.init_conv(x)
 
@@ -831,7 +951,9 @@ class Unet(Module):
         assert not (exists(cond) ^ exists(self.cond_mlp))
 
         if exists(cond):
-            assert exists(self.cond_mlp), f'`accept_cond` and `dim_cond` must be set on init for `Unet`'
+            assert exists(self.cond_mlp), (
+                f"`accept_cond` and `dim_cond` must be set on init for `Unet`"
+            )
             c = self.cond_mlp(cond)
             t = t + c
 
@@ -858,16 +980,16 @@ class Unet(Module):
         x = self.reduce_streams(x)
 
         for block1, block2, attn, upsample in self.ups:
-            x = cat((x, h.pop()), dim = 1)
+            x = cat((x, h.pop()), dim=1)
             x = block1(x, t)
 
-            x = cat((x, h.pop()), dim = 1)
+            x = cat((x, h.pop()), dim=1)
             x = block2(x, t)
             x = attn(x)
 
             x = upsample(x)
 
-        x = cat((x, r), dim = 1)
+        x = cat((x, r), dim=1)
 
         x = self.final_res_block(x, t)
 
@@ -876,9 +998,12 @@ class Unet(Module):
         if not self.mean_variance_net:
             return out
 
-        mean, log_var = rearrange(out, 'b (c mean_log_var) h w -> mean_log_var b c h w', mean_log_var = 2)
-        variance = log_var.exp() # variance needs to be positive
+        mean, log_var = rearrange(
+            out, "b (c mean_log_var) h w -> mean_log_var b c h w", mean_log_var=2
+        )
+        variance = log_var.exp()  # variance needs to be positive
         return stack((mean, variance))
+
 
 # dataset classes
 
@@ -889,14 +1014,15 @@ import torchvision.transforms as T
 
 from PIL import Image
 
+
 class ImageDataset(Dataset):
     def __init__(
         self,
         folder: str | Path,
         image_size: int,
-        exts: list[str] = ['jpg', 'jpeg', 'png', 'tiff'],
-        augment_horizontal_flip = False,
-        convert_image_to = None
+        exts: list[str] = ["jpg", "jpeg", "png", "tiff"],
+        augment_horizontal_flip=False,
+        convert_image_to=None,
     ):
         super().__init__()
         if isinstance(folder, str):
@@ -907,7 +1033,7 @@ class ImageDataset(Dataset):
         self.folder = folder
         self.image_size = image_size
 
-        self.paths = [p for ext in exts for p in folder.glob(f'**/*.{ext}')]
+        self.paths = [p for ext in exts for p in folder.glob(f"**/*.{ext}")]
 
         def convert_image_to_fn(img_type, image):
             if image.mode == img_type:
@@ -915,15 +1041,21 @@ class ImageDataset(Dataset):
 
             return image.convert(img_type)
 
-        maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
+        maybe_convert_fn = (
+            partial(convert_image_to_fn, convert_image_to)
+            if exists(convert_image_to)
+            else nn.Identity()
+        )
 
-        self.transform = T.Compose([
-            T.Lambda(maybe_convert_fn),
-            T.Resize(image_size),
-            T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
-            T.CenterCrop(image_size),
-            T.ToTensor()
-        ])
+        self.transform = T.Compose(
+            [
+                T.Lambda(maybe_convert_fn),
+                T.Resize(image_size),
+                T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
+                T.CenterCrop(image_size),
+                T.ToTensor(),
+            ]
+        )
 
     def __len__(self):
         return len(self.paths)
@@ -933,6 +1065,7 @@ class ImageDataset(Dataset):
         img = Image.open(path)
         return self.transform(img)
 
+
 # trainer
 
 from torch.optim import Adam
@@ -940,10 +1073,12 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from ema_pytorch import EMA
 
+
 def cycle(dl):
     while True:
         for batch in dl:
             yield batch
+
 
 class Trainer(Module):
     def __init__(
@@ -951,25 +1086,35 @@ class Trainer(Module):
         rectified_flow: dict | RectifiedFlow | NanoFlow,
         *,
         dataset: dict | Dataset,
-        num_train_steps = 70_000,
-        learning_rate = 3e-4,
-        batch_size = 16,
-        checkpoints_folder: str = './checkpoints',
-        results_folder: str = './results',
+        num_train_steps=70_000,
+        learning_rate=3e-4,
+        batch_size=16,
+        checkpoints_folder: str = "./checkpoints",
+        results_folder: str = "./results",
         save_results_every: int = 100,
         checkpoint_every: int = 1000,
-        sample_temperature: float = 1.,
+        sample_temperature: float = 1.0,
         num_samples: int = 16,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         ema_kwargs: dict = dict(),
-        use_ema = True,
-        max_grad_norm = 0.5,
-        use_wandb = False,
-        wandb_project = 'rectified-flow',
-        wandb_run_name = None,
+        use_ema=True,
+        max_grad_norm=0.5,
+        use_wandb=False,
+        wandb_project="rectified-flow",
+        wandb_run_name=None,
         wandb_kwargs: dict = dict(),
-        config = None
+        config=None,
+        eval_every: int = 5000,
+        eval_num_samples: int = 5000,
+        eval_batch_size: int = 50,
+        eval_reference_batch: str = "third_party/guided-diffusion/evaluations/VIRTUAL_oxford_flowers256.npz",
+        # performance controls
+        dataloader_prefetch_factor: int | None = None,
+        dataloader_persistent_workers: bool = True,
+        sample_during_training: bool = True,
+        log_every: int = 10,
+        compute_norms_every: int = 0,
     ):
         super().__init__()
         self.accelerator = Accelerator(**accelerate_kwargs)
@@ -985,27 +1130,69 @@ class Trainer(Module):
         # determine whether to keep track of EMA (if not using consistency FM)
         # which will determine which model to use for sampling
 
-        use_ema &= not getattr(self.model, 'use_consistency', False)
+        use_ema &= not getattr(self.model, "use_consistency", False)
 
         self.use_ema = use_ema
         self.ema_model = None
 
         if self.is_main and use_ema:
             self.ema_model = EMA(
-                self.model,
-                forward_method_names = ('sample',),
-                **ema_kwargs
+                self.model, forward_method_names=("sample",), **ema_kwargs
             )
 
             self.ema_model.to(self.accelerator.device)
 
         # optimizer, dataloader, and all that
 
-        self.optimizer = Adam(rectified_flow.parameters(), lr = learning_rate, **adam_kwargs)
-        num_workers = getattr(config, 'num_workers', 4) if config else 4
-        self.dl = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = True, num_workers = num_workers, pin_memory = True)
+        self.optimizer = Adam(
+            rectified_flow.parameters(), lr=learning_rate, **adam_kwargs
+        )
+        num_workers = getattr(config, "num_workers", 4) if config else 4
 
-        self.model, self.optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.dl)
+        # enable cudnn benchmark for fixed image sizes
+        try:
+            import torch.backends.cudnn as cudnn
+
+            cudnn.benchmark = True
+        except Exception:
+            pass
+
+        # tune dataloader for throughput
+        if num_workers > 0:
+            if dataloader_prefetch_factor is not None:
+                self.dl = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    drop_last=True,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    prefetch_factor=dataloader_prefetch_factor,
+                    persistent_workers=dataloader_persistent_workers,
+                )
+            else:
+                self.dl = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    drop_last=True,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    persistent_workers=dataloader_persistent_workers,
+                )
+        else:
+            self.dl = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=True,
+                num_workers=0,
+                pin_memory=True,
+            )
+
+        self.model, self.optimizer, self.dl = self.accelerator.prepare(
+            self.model, self.optimizer, self.dl
+        )
 
         self.num_train_steps = num_train_steps
 
@@ -1016,15 +1203,17 @@ class Trainer(Module):
         self.checkpoints_folder = Path(checkpoints_folder)
         self.results_folder = Path(results_folder)
 
-        self.checkpoints_folder.mkdir(exist_ok = True, parents = True)
-        self.results_folder.mkdir(exist_ok = True, parents = True)
+        self.checkpoints_folder.mkdir(exist_ok=True, parents=True)
+        self.results_folder.mkdir(exist_ok=True, parents=True)
 
         self.checkpoint_every = checkpoint_every
         self.save_results_every = save_results_every
         self.sample_temperature = sample_temperature
 
         self.num_sample_rows = int(math.sqrt(num_samples))
-        assert (self.num_sample_rows ** 2) == num_samples, f'{num_samples} must be a square'
+        assert (self.num_sample_rows**2) == num_samples, (
+            f"{num_samples} must be a square"
+        )
         self.num_samples = num_samples
 
         assert self.checkpoints_folder.is_dir()
@@ -1038,14 +1227,26 @@ class Trainer(Module):
         self.wandb_kwargs = wandb_kwargs
         self.config = config
 
+        # Evaluation parameters
+        self.eval_every = eval_every
+        self.eval_num_samples = eval_num_samples
+        self.eval_batch_size = eval_batch_size
+        self.eval_reference_batch = eval_reference_batch
+
         # Store data shape for sampling (avoid dataloader access during sampling)
         self.data_shape = None
 
         # Profiling setup
-        self.enable_profiling = os.environ.get('RECTIFIED_FLOW_PROFILE', '0') == '1'
+        self.enable_profiling = os.environ.get("RECTIFIED_FLOW_PROFILE", "0") == "1"
         if self.enable_profiling:
             from .training_profiler import start_training_profiling
+
             start_training_profiling(log_every=50)
+
+        # performance toggles
+        self.sample_during_training = sample_during_training
+        self.log_every = max(1, int(log_every))
+        self.compute_norms_every = int(compute_norms_every)
 
         self.init_wandb()
 
@@ -1053,19 +1254,29 @@ class Trainer(Module):
         """Initialize Weights & Biases logging if enabled."""
         if self.is_main and self.use_wandb:
             import wandb
+
             # Prepare config for wandb logging
             wandb_config = {}
             if self.config is not None:
                 # Convert dataclass to dict for wandb
-                if hasattr(self.config, '__dict__'):
+                if hasattr(self.config, "__dict__"):
                     wandb_config = vars(self.config)
-                elif hasattr(self.config, '__annotations__'):
+                elif hasattr(self.config, "__annotations__"):
                     # Handle dataclass
-                    wandb_config = {k: getattr(self.config, k) for k in self.config.__annotations__}
+                    wandb_config = {
+                        k: getattr(self.config, k) for k in self.config.__annotations__
+                    }
                 else:
-                    wandb_config = dict(self.config) if hasattr(self.config, 'items') else {}
-            
-            wandb.init(project=self.wandb_project, name=self.wandb_run_name, config=wandb_config, **self.wandb_kwargs)
+                    wandb_config = (
+                        dict(self.config) if hasattr(self.config, "items") else {}
+                    )
+
+            wandb.init(
+                project=self.wandb_project,
+                name=self.wandb_run_name,
+                config=wandb_config,
+                **self.wandb_kwargs,
+            )
 
     @property
     def is_main(self):
@@ -1076,9 +1287,9 @@ class Trainer(Module):
             return
 
         save_package = dict(
-            model = self.accelerator.unwrap_model(self.model).state_dict(),
-            ema_model = self.ema_model.state_dict(),
-            optimizer = self.optimizer.state_dict(),
+            model=self.accelerator.unwrap_model(self.model).state_dict(),
+            ema_model=self.ema_model.state_dict(),
+            optimizer=self.optimizer.state_dict(),
         )
 
         torch.save(save_package, str(self.checkpoints_folder / path))
@@ -1086,9 +1297,9 @@ class Trainer(Module):
     def load(self, path):
         if not self.is_main:
             return
-        
+
         load_package = torch.load(path)
-        
+
         self.model.load_state_dict(load_package["model"])
         self.ema_model.load_state_dict(load_package["ema_model"])
         self.optimizer.load_state_dict(load_package["optimizer"])
@@ -1101,35 +1312,105 @@ class Trainer(Module):
 
     def sample(self, fname):
         eval_model = default(self.ema_model, self.model)
-        
+
         # Use stored data_shape instead of accessing dataloader
-        assert self.data_shape is not None, "data_shape not set. Run at least one training step first."
+        assert self.data_shape is not None, (
+            "data_shape not set. Run at least one training step first."
+        )
         data_shape = self.data_shape
 
         additional_sample_kwargs = dict()
         if isinstance(eval_model.model, RectifiedFlow):
-            additional_sample_kwargs.update(temperature = self.sample_temperature)
+            additional_sample_kwargs.update(temperature=self.sample_temperature)
 
         with torch.no_grad():
             sampled = eval_model.sample(
-                batch_size = self.num_samples,
-                data_shape = data_shape,
-                **additional_sample_kwargs
+                batch_size=self.num_samples,
+                data_shape=data_shape,
+                **additional_sample_kwargs,
             )
-      
-        sampled = rearrange(sampled, '(row col) c h w -> c (row h) (col w)', row = self.num_sample_rows)
-        sampled.clamp_(0., 1.)
+
+        sampled = rearrange(
+            sampled, "(row col) c h w -> c (row h) (col w)", row=self.num_sample_rows
+        )
+        sampled.clamp_(0.0, 1.0)
 
         save_image(sampled, fname)
         return sampled
 
-    def forward(self):
+    def run_evaluation(self, checkpoint_path: str, step: int):
+        """Run evaluation on checkpoint and log to wandb."""
+        if not self.is_main:
+            return
 
+        try:
+            print(f"Running evaluation for step {step}...")
+
+            # Import evaluation script functions
+            import subprocess
+            import sys
+
+            # Run the evaluation script
+            eval_cmd = [
+                sys.executable,
+                "evaluate_checkpoint.py",
+                "--checkpoint",
+                str(self.checkpoints_folder / checkpoint_path),
+                "--num_samples",
+                str(self.eval_num_samples),
+                "--batch_size",
+                str(self.eval_batch_size),
+                "--image_size",
+                str(getattr(self.config, "image_size", 64)),
+                "--reference_batch",
+                self.eval_reference_batch,
+                "--step",
+                str(step),
+                "--output_dir",
+                str(self.results_folder / "eval_samples"),
+            ]
+
+            if self.use_wandb:
+                eval_cmd.extend(["--wandb_project", self.wandb_project])
+
+            result = subprocess.run(eval_cmd, capture_output=True, text=True, cwd=".")
+
+            if result.returncode == 0:
+                print(f"Evaluation completed for step {step}")
+                # The evaluation script handles wandb logging
+            else:
+                print(f"Evaluation failed for step {step}")
+                print("STDOUT:", result.stdout)
+                print("STDERR:", result.stderr)
+
+                # Log failure to wandb
+                if self.use_wandb:
+                    import wandb
+
+                    wandb.log(
+                        {
+                            "eval_step": step,
+                            "eval_failed": True,
+                            "error": result.stderr,
+                        },
+                        step=step,
+                    )
+
+        except Exception as e:
+            print(f"Evaluation error for step {step}: {e}")
+            if self.use_wandb:
+                import wandb
+
+                wandb.log(
+                    {"eval_step": step, "eval_failed": True, "error": str(e)}, step=step
+                )
+
+    def forward(self):
         dl = cycle(self.dl)
 
         # Create progress bar on main process
         if self.accelerator.is_main_process:
-            pbar = tqdm(total=self.num_train_steps, desc='Training', unit='step')
+            pbar = tqdm(total=self.num_train_steps, desc="Training", unit="step")
         else:
             pbar = None
 
@@ -1141,6 +1422,7 @@ class Trainer(Module):
             # Profile data loading
             if self.enable_profiling:
                 from .training_profiler import profile_data_loading
+
                 with profile_data_loading():
                     data = next(dl)
             else:
@@ -1149,16 +1431,19 @@ class Trainer(Module):
             # Profile forward pass
             if self.enable_profiling:
                 from .training_profiler import profile_forward_pass
+
                 with profile_forward_pass():
                     if self.return_loss_breakdown:
-                        loss, loss_breakdown = self.model(data, return_loss_breakdown = True)
-                        self.log(loss_breakdown._asdict(), step = step)
+                        loss, loss_breakdown = self.model(
+                            data, return_loss_breakdown=True
+                        )
+                        self.log(loss_breakdown._asdict(), step=step)
                     else:
                         loss = self.model(data)
             else:
                 if self.return_loss_breakdown:
-                    loss, loss_breakdown = self.model(data, return_loss_breakdown = True)
-                    self.log(loss_breakdown._asdict(), step = step)
+                    loss, loss_breakdown = self.model(data, return_loss_breakdown=True)
+                    self.log(loss_breakdown._asdict(), step=step)
                 else:
                     loss = self.model(data)
 
@@ -1169,76 +1454,108 @@ class Trainer(Module):
             # Profile backward pass
             if self.enable_profiling:
                 from .training_profiler import profile_backward_pass
+
                 with profile_backward_pass():
                     self.accelerator.backward(loss)
             else:
                 self.accelerator.backward(loss)
 
-            # Update progress bar after backward pass (when gradients are available)
+            # Update progress bar and (optionally) compute expensive norms less frequently
             if self.accelerator.is_main_process:
-                current_lr = self.optimizer.param_groups[0]['lr']
-                # Compute grad_norm and param_norm for display and logging (on CPU to avoid GPU utilization drops)
-                if self.enable_profiling:
-                    from .training_profiler import profile_metrics_computation
-                    with profile_metrics_computation():
+                current_lr = self.optimizer.param_groups[0]["lr"]
+
+                grad_norm = None
+                param_norm = None
+                compute_norms = self.compute_norms_every > 0 and (
+                    step % self.compute_norms_every == 0
+                )
+                if compute_norms:
+                    if self.enable_profiling:
+                        from .training_profiler import profile_metrics_computation
+
+                        with profile_metrics_computation():
+                            unwrapped_model = self.accelerator.unwrap_model(self.model)
+                            grad_sq_sum = torch.tensor(0.0)
+                            param_sq_sum = torch.tensor(0.0)
+                            for p in unwrapped_model.parameters():
+                                if p.grad is not None:
+                                    grad_sq_sum += (p.grad.detach().cpu() ** 2).sum()
+                                param_sq_sum += (p.detach().cpu() ** 2).sum()
+                            grad_norm = torch.sqrt(grad_sq_sum)
+                            param_norm = torch.sqrt(param_sq_sum)
+                    else:
                         unwrapped_model = self.accelerator.unwrap_model(self.model)
-                        grad_sq_sum = torch.tensor(0.)
-                        param_sq_sum = torch.tensor(0.)
+                        grad_sq_sum = torch.tensor(0.0)
+                        param_sq_sum = torch.tensor(0.0)
                         for p in unwrapped_model.parameters():
                             if p.grad is not None:
                                 grad_sq_sum += (p.grad.detach().cpu() ** 2).sum()
                             param_sq_sum += (p.detach().cpu() ** 2).sum()
                         grad_norm = torch.sqrt(grad_sq_sum)
                         param_norm = torch.sqrt(param_sq_sum)
-                else:
-                    unwrapped_model = self.accelerator.unwrap_model(self.model)
-                    grad_sq_sum = torch.tensor(0.)
-                    param_sq_sum = torch.tensor(0.)
-                    for p in unwrapped_model.parameters():
-                        if p.grad is not None:
-                            grad_sq_sum += (p.grad.detach().cpu() ** 2).sum()
-                        param_sq_sum += (p.detach().cpu() ** 2).sum()
-                    grad_norm = torch.sqrt(grad_sq_sum)
-                    param_norm = torch.sqrt(param_sq_sum)
-            
-                # Update progress bar after backward pass (when gradients are available)
-                pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'lr': f'{current_lr:.2e}',
-                    'grad_norm': f'{grad_norm.item():.2f}',
-                    'param_norm': f'{param_norm.item():.2f}'
-                })
+
+                if (step % self.log_every) == 0:
+                    postfix = {
+                        "loss": f"{loss.item():.4f}",
+                        "lr": f"{current_lr:.2e}",
+                    }
+                    if (
+                        compute_norms
+                        and grad_norm is not None
+                        and param_norm is not None
+                    ):
+                        postfix.update(
+                            {
+                                "grad_norm": f"{grad_norm.item():.2f}",
+                                "param_norm": f"{param_norm.item():.2f}",
+                            }
+                        )
+                    pbar.set_postfix(postfix)
                 pbar.update(1)
 
-                if self.use_wandb:
+                if self.use_wandb and (step % self.log_every) == 0:
                     import wandb
+
                     log_dict = {
-                        'loss': loss.item(),
-                        'learning_rate': self.optimizer.param_groups[0]['lr'],
-                        'grad_norm': grad_norm.item(),
-                        'param_norm': param_norm.item(),
+                        "loss": loss.item(),
+                        "learning_rate": current_lr,
                     }
+                    if (
+                        compute_norms
+                        and grad_norm is not None
+                        and param_norm is not None
+                    ):
+                        log_dict.update(
+                            {
+                                "grad_norm": grad_norm.item(),
+                                "param_norm": param_norm.item(),
+                            }
+                        )
                     if self.return_loss_breakdown:
                         log_dict.update(loss_breakdown._asdict())
                     wandb.log(log_dict, step=step)
 
-            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.accelerator.clip_grad_norm_(
+                self.model.parameters(), self.max_grad_norm
+            )
 
             # Profile optimizer step
             if self.enable_profiling:
                 from .training_profiler import profile_optimizer_step
+
                 with profile_optimizer_step():
                     self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
             else:
                 self.optimizer.step()
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
             # Profile EMA updates
             if self.enable_profiling:
                 from .training_profiler import profile_ema_update
+
                 with profile_ema_update():
-                    if getattr(self.model, 'use_consistency', False):
+                    if getattr(self.model, "use_consistency", False):
                         self.model.ema_model.update()
 
                     if self.is_main and self.use_ema:
@@ -1248,7 +1565,7 @@ class Trainer(Module):
                         self.ema_model.ema_model.data_shape = data_shape
                         self.ema_model.update()
             else:
-                if getattr(self.model, 'use_consistency', False):
+                if getattr(self.model, "use_consistency", False):
                     self.model.ema_model.update()
 
                 if self.is_main and self.use_ema:
@@ -1258,20 +1575,26 @@ class Trainer(Module):
                     self.ema_model.ema_model.data_shape = data_shape
                     self.ema_model.update()
 
-            self.accelerator.wait_for_everyone()
+            # avoid per-step global barrier; we'll sync after heavy IO (sampling/checkpoint)
 
             if self.accelerator.is_main_process:
-
-                if divisible_by(step, self.save_results_every):
+                if self.sample_during_training and divisible_by(
+                    step, self.save_results_every
+                ):
                     # Profile sampling
                     if self.enable_profiling:
                         from .training_profiler import profile_sampling
-                        with profile_sampling():
-                            sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'))
-                    else:
-                        sampled = self.sample(fname = str(self.results_folder / f'results.{step}.png'))
 
-                    self.log_images(sampled, step = step)
+                        with profile_sampling():
+                            sampled = self.sample(
+                                fname=str(self.results_folder / f"results.{step}.png")
+                            )
+                    else:
+                        sampled = self.sample(
+                            fname=str(self.results_folder / f"results.{step}.png")
+                        )
+
+                    self.log_images(sampled, step=step)
 
                     # Log images to wandb if enabled
                     if self.use_wandb:
@@ -1283,20 +1606,38 @@ class Trainer(Module):
                         pil_image = to_pil(sampled.cpu())
 
                         # Log to wandb
-                        wandb.log({
-                            "generated_images": wandb.Image(pil_image, caption=f"Step {step}")
-                        }, step=step)
+                        wandb.log(
+                            {
+                                "generated_images": wandb.Image(
+                                    pil_image, caption=f"Step {step}"
+                                )
+                            },
+                            step=step,
+                        )
 
                 if divisible_by(step, self.checkpoint_every):
                     # Profile checkpointing
                     if self.enable_profiling:
                         from .training_profiler import profile_checkpointing
-                        with profile_checkpointing():
-                            self.save(f'checkpoint.{step}.pt')
-                    else:
-                        self.save(f'checkpoint.{step}.pt')
 
-            self.accelerator.wait_for_everyone()
+                        with profile_checkpointing():
+                            checkpoint_path = f"checkpoint.{step}.pt"
+                            self.save(checkpoint_path)
+                    else:
+                        checkpoint_path = f"checkpoint.{step}.pt"
+                        self.save(checkpoint_path)
+
+                    # Run evaluation every eval_every steps
+                    if divisible_by(step, self.eval_every):
+                        self.run_evaluation(checkpoint_path, step)
+
+            # sync deterministically across ranks when IO-heavy events happen
+            did_io = (
+                self.sample_during_training
+                and divisible_by(step, self.save_results_every)
+            ) or divisible_by(step, self.checkpoint_every)
+            if did_io:
+                self.accelerator.wait_for_everyone()
 
         # Close progress bar
         if self.accelerator.is_main_process and pbar is not None:
@@ -1305,6 +1646,7 @@ class Trainer(Module):
         # End profiling and print summary
         if self.enable_profiling:
             from .training_profiler import end_training_profiling
+
             end_training_profiling()
 
-        print('training complete')
+        print("training complete")
