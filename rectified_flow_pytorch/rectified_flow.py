@@ -1317,6 +1317,7 @@ class Trainer(Module):
         save_package = dict(
             model=self.accelerator.unwrap_model(self.model).state_dict(),
             optimizer=self.optimizer.state_dict(),
+            config=self.config,  # Save configuration for evaluation
         )
 
         # Only save EMA model if it exists
@@ -1404,8 +1405,8 @@ class Trainer(Module):
                 str(self.results_folder / "eval_samples"),
             ]
 
-            if self.use_wandb:
-                eval_cmd.extend(["--wandb_project", self.wandb_project])
+            # Don't pass wandb_project - reuse existing wandb run
+            # The evaluation script will check if wandb is already initialized
 
             result = subprocess.run(eval_cmd, capture_output=True, text=True, cwd=".")
 
